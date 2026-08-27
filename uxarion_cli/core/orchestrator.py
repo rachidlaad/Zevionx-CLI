@@ -50,6 +50,7 @@ class AutonomousOrchestrator:
         self.scope: Set[str] = set()
         self.allow_tools: Optional[Set[str]] = None
         self.deny_tools: Optional[Set[str]] = None
+        self.conversation_context: Optional[Dict[str, Any]] = None
         self.loop_mode: str = "direct"
         self._agent = None
         self._stop_requested = False
@@ -73,6 +74,7 @@ class AutonomousOrchestrator:
         allow_tools: Optional[Set[str]] = None,
         deny_tools: Optional[Set[str]] = None,
         scope_hosts: Optional[Set[str]] = None,
+        conversation_context: Optional[Dict[str, Any]] = None,
         loop_mode: Optional[str] = None,
     ) -> str:
         self.session_id = uuid.uuid4().hex
@@ -82,6 +84,7 @@ class AutonomousOrchestrator:
             self.scope.add(target)
         self.allow_tools = set(allow_tools) if allow_tools else None
         self.deny_tools = set(deny_tools) if deny_tools else None
+        self.conversation_context = dict(conversation_context) if conversation_context else None
         normalizer = getattr(_load_agent_module(), "normalize_loop_mode", None)
         if callable(normalizer):
             self.loop_mode = normalizer(loop_mode, default="direct")
@@ -142,6 +145,8 @@ class AutonomousOrchestrator:
             kwargs["allow_tools"] = set(self.allow_tools)
         if self.deny_tools:
             kwargs["deny_tools"] = set(self.deny_tools)
+        if self.conversation_context:
+            kwargs["conversation_context"] = dict(self.conversation_context)
         kwargs["loop_mode"] = self.loop_mode
         return kwargs
 

@@ -67,6 +67,23 @@ class KeyWorkflowTests(unittest.TestCase):
                     os.environ["OPENAI_API_KEY"] = previous
                 os.chdir(cwd)
 
+    def test_load_api_keys_prefers_environment_over_env_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            cwd = os.getcwd()
+            os.chdir(tmp_dir)
+            previous = os.environ.get("OPENAI_API_KEY")
+            try:
+                Path(".env").write_text("OPENAI_API_KEY=sk-from-env-file\n", encoding="utf-8")
+                os.environ["OPENAI_API_KEY"] = "sk-from-environment"
+                keys = self.agent_module.load_api_keys()
+                self.assertEqual(keys.get("openai"), "sk-from-environment")
+            finally:
+                if previous is None:
+                    os.environ.pop("OPENAI_API_KEY", None)
+                else:
+                    os.environ["OPENAI_API_KEY"] = previous
+                os.chdir(cwd)
+
     def test_main_addkey_mode_without_prompt(self) -> None:
         argv_backup = sys.argv[:]
         try:
@@ -98,6 +115,24 @@ class KeyWorkflowTests(unittest.TestCase):
                 rc = self.agent_module.main()
             self.assertEqual(rc, 0)
             doctor.assert_called_once()
+        finally:
+            sys.argv = argv_backup
+
+    def test_main_handles_agent_runtime_error_without_traceback(self) -> None:
+        argv_backup = sys.argv[:]
+        stdout = io.StringIO()
+        try:
+            sys.argv = ["uxarion_cli.py", "--prompt", "hello"]
+            fake_agent = mock.Mock()
+            fake_agent.run.side_effect = RuntimeError("boom")
+            with mock.patch.object(self.agent_module, "Agent", return_value=fake_agent), mock.patch(
+                "sys.stdout", new=stdout
+            ):
+                rc = self.agent_module.main()
+            self.assertEqual(rc, 1)
+            out = stdout.getvalue()
+            self.assertIn("error: boom", out)
+            self.assertNotIn("Traceback", out)
         finally:
             sys.argv = argv_backup
 
@@ -230,7 +265,7 @@ class KeyWorkflowTests(unittest.TestCase):
         from uxarion_cli.ui.chat_ui import ChatUI
 
         ui = ChatUI()
-        self.assertEqual(ui.prompt_template, "[cyan]>[/] ")
+        self.assertEqual(ui.prompt_template, "> ")
 
     def test_chat_hides_status_intent_and_completed_events(self) -> None:
         from uxarion_cli.ui.chat_ui import ChatUI
@@ -252,6 +287,22 @@ class KeyWorkflowTests(unittest.TestCase):
         formatted, report = ui._format_event_for_display({"type": "report", "report": "hello"})
         self.assertIsNone(formatted)
         self.assertEqual(report, "hello")
+
+    def test_chat_context_stores_compact_command_summary_only(self) -> None:
+        from uxarion_cli.ui.chat_ui import ConversationContext
+
+        ctx = ConversationContext()
+        ctx.add_command_execution(
+            "curl -i http://localhost:5002",
+            0,
+            step_summary="HTTP 200 with server header",
+            evidence=["HTTP/1.1 200 OK", "Server: uvicorn"],
+        )
+        payload = ctx.as_agent_context()
+        self.assertTrue(payload["carry_over_notes"])
+        self.assertIn("curl -i http://localhost:5002", payload["carry_over_notes"][0])
+        self.assertIn("HTTP/1.1 200 OK", payload["carry_over_findings"])
+        self.assertNotIn("Output:", payload["carry_over_notes"][0])
 
 
 if __name__ == "__main__":  # pragma: no cover

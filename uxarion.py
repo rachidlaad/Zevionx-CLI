@@ -48,6 +48,9 @@ def _run_agent(args: List[str]) -> int:
     except KeyboardInterrupt:
         print("\nSession interrupted by user.")
         return 130
+    except Exception as exc:
+        print(f"error: {exc}")
+        return 1
 
 
 def _launch_chat() -> int:

@@ -41,23 +41,22 @@ class InteractiveUI:
         try:
             self._main_loop()
         except KeyboardInterrupt:
-            self.console.print("\n[yellow]👋 Goodbye![/]")
+            self.console.print("\n[yellow]Goodbye.[/]")
             sys.exit(0)
 
     def _get_banner(self) -> str:
         """Return the Uxarion banner"""
         return """                           Uxarion CLI
 
-I would be happy for you to connect, collaborate, fix a bug or add a feature to the tool 😊
-X.com > @Rachid_LLLL    Gmail > rachidshade@gmail.com    GitHub > https://github.com/rachidlaad
+Open-source AI pentesting copilot for authorized security testing.
 
 Uxarion is an AI pentesting copilot, open-source for the pentesting community.
 Bring your own API key and drive proven CLI tools (sqlmap, gobuster, nikto, nmap)
 through a safe, single-command loop.
 
-🤖 Powered by OpenAI GPT-5.2 for autonomous decision making
-⚠️  AUTHORIZED USE ONLY - Test only systems you own or have permission to test
-🛡️  Enhanced with enterprise-grade safety controls and command validation
+Powered by OpenAI GPT-5.2 for autonomous decision making
+AUTHORIZED USE ONLY - Test only systems you own or have permission to test
+Enhanced with enterprise-grade safety controls and command validation
 
 # Chat mode started. Type your objective/instructions
 # Ctrl-C interrupts a running loop; 'quit' to exit
@@ -67,7 +66,7 @@ through a safe, single-command loop.
         """Main interactive loop"""
         while True:
             try:
-                command = self.console.input("\n[cyan]you>[/] ").strip()
+                command = self.console.input("\n[cyan]>[/] ").strip()
 
                 if command in ["quit", "exit", "q"]:
                     break
@@ -86,7 +85,6 @@ through a safe, single-command loop.
                 elif command:
                     # Treat as new objective and run immediately
                     self.objective = command
-                    self.console.print(f"[bold cyan]Objective set:[/] {self.objective}")
                     self._start_pentest()
 
             except KeyboardInterrupt:
@@ -114,7 +112,7 @@ through a safe, single-command loop.
         settings_panel = Panel(
             f"[bold yellow]Current Settings:[/]\n"
             f"[cyan]Target:[/] {self.target}\n"
-            f"[cyan]Objective:[/] {self.objective}\n"
+            f"[cyan]Task:[/] {self.objective}\n"
             f"[cyan]Model:[/] gpt-5.2\n"
             f"[cyan]Advanced Tools:[/] {'Enabled' if self.enable_advanced else 'Disabled'}",
             title="Settings",
@@ -144,13 +142,12 @@ through a safe, single-command loop.
 
     def _start_pentest(self):
         """Start the penetration test"""
-        self.console.print(f"\n[bold green]🚀 Starting AI-driven penetration test...[/]")
+        self.console.print(f"\n[bold green]Starting AI-driven penetration test...[/]")
         self.console.print(f"[cyan]Target:[/] {self.target}")
-        self.console.print(f"[cyan]Objective:[/] {self.objective}")
         self.console.print("[cyan]Model:[/] gpt-5.2")
 
         if self.enable_advanced:
-            self.console.print("[yellow]⚔️  Advanced tools enabled (SQLMap, Nmap, Gobuster, Nikto)[/]")
+            self.console.print("[yellow]Advanced tools enabled (SQLMap, Nmap, Gobuster, Nikto)[/]")
 
         # Build command to execute the original CLI
         agent_script = Path(__file__).resolve().parents[2] / "uxarion_cli.py"
@@ -183,12 +180,12 @@ through a safe, single-command loop.
             result = subprocess.run(cmd, capture_output=False, text=True)
 
             if result.returncode == 0:
-                self.console.print("\n[bold green]✅ Penetration test completed successfully![/]")
+                self.console.print("\n[bold green]Penetration test completed successfully.[/]")
             else:
-                self.console.print(f"\n[bold red]❌ Test completed with errors (exit code: {result.returncode})[/]")
+                self.console.print(f"\n[bold red]Test completed with errors (exit code: {result.returncode})[/]")
 
         except Exception as e:
-            self.console.print(f"[bold red]❌ Error executing test: {e}[/]")
+            self.console.print(f"[bold red]Error executing test: {e}[/]")
 
         self.console.print("\n[dim]Press Enter to continue...[/]")
         input()

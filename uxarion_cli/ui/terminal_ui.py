@@ -23,8 +23,7 @@ except ImportError:
 
 BANNER = """                           Uxarion CLI
 
-I would be happy for you to connect, collaborate, fix a bug or add a feature to the tool 😊
-X.com > @Rachid_LLLL    Gmail > rachidshade@gmail.com    GitHub > https://github.com/rachidlaad
+Open-source AI pentesting copilot for authorized security testing.
 
 Uxarion is an AI pentesting copilot, open-source for the pentesting community.
 Bring your own API key and drive proven CLI tools (sqlmap, gobuster, nikto, nmap)
@@ -34,7 +33,7 @@ through a safe, single-command loop.
 # Ctrl-C interrupts a running loop; 'quit' to exit
 # Type '/' + Enter to see menu, then type option number + Enter
 
-you> """
+> """
 
 
 class TerminalUI:
@@ -60,14 +59,14 @@ class TerminalUI:
         try:
             asyncio.run(self._main_loop())
         except KeyboardInterrupt:
-            self.console.print("\n👋 Goodbye!")
+            self.console.print("\nGoodbye.")
             sys.exit(0)
 
     async def _main_loop(self):
         """Main async UI loop"""
         while True:
             try:
-                command = self.console.input("you> ").strip()
+                command = self.console.input("> ").strip()
 
                 if command == "quit":
                     break
@@ -96,7 +95,7 @@ class TerminalUI:
                 elif command:
                     # Treat as new objective
                     self.objective = command
-                    self.console.print(f"[bold cyan]Objective:[/] {self.objective}")
+                    self.console.print(f"[bold cyan]Queued:[/] {self.objective}")
 
             except KeyboardInterrupt:
                 if self.current_session:
@@ -118,14 +117,13 @@ class TerminalUI:
 
 [bold yellow]Current Settings:[/]
 Target: {target}
-Objective: {objective}
+Task: {objective}
 """.format(target=self.target, objective=self.objective))
 
     async def _start_session(self):
         """Start reconnaissance session with live streaming"""
-        self.console.print(f"[bold green]🚀 Starting AI reconnaissance...[/]")
+        self.console.print(f"[bold green]Starting AI reconnaissance...[/]")
         self.console.print(f"[cyan]Target:[/] {self.target}")
-        self.console.print(f"[cyan]Objective:[/] {self.objective}")
 
         try:
             # Start the session
@@ -222,13 +220,13 @@ Objective: {objective}
             step_id = data.get("id", "")
             command = data.get("command", "")
             reason = data.get("reason", "")
-            self.log_lines.append(f"[bold cyan]→ {reason}[/]")
+            self.log_lines.append(f"[bold cyan]{reason}[/]")
             self.log_lines.append(f"[yellow]$ {command}[/]")
 
         elif event_type == "step.finished":
             exit_code = data.get("exit_code", 0)
             duration = data.get("duration", 0)
-            status = "[green]✓[/]" if exit_code == 0 else "[red]✗[/]"
+            status = "[green]ok[/]" if exit_code == 0 else "[red]fail[/]"
             self.log_lines.append(f"{status} Command finished (exit: {exit_code}, {duration:.1f}s)")
 
         elif event_type == "vulnerability.found":
@@ -236,15 +234,15 @@ Objective: {objective}
             severity = data.get("severity", "")
             target = data.get("target", "")
             severity_color = {"critical": "red", "high": "yellow", "medium": "blue", "low": "green"}.get(severity, "white")
-            self.log_lines.append(f"[bold {severity_color}]🚨 {severity.upper()}: {vuln_type} at {target}[/]")
+            self.log_lines.append(f"[bold {severity_color}]{severity.upper()}: {vuln_type} at {target}[/]")
 
         elif event_type == "ai.analysis":
             analysis = data.get("analysis", "")
-            self.log_lines.append(f"[bold magenta]🤖 AI: {analysis}[/]")
+            self.log_lines.append(f"[bold magenta]AI: {analysis}[/]")
 
         elif event_type == "error":
             message = data.get("message", "")
-            self.log_lines.append(f"[red]❌ Error: {message}[/]")
+            self.log_lines.append(f"[red]Error: {message}[/]")
 
         # Keep only recent logs
         if len(self.log_lines) > 100:
@@ -268,7 +266,7 @@ Objective: {objective}
 
         # Status panel
         status_text = f"""[bold]Target:[/] {self.target}
-[bold]Objective:[/] {self.objective}
+[bold]Task:[/] {self.objective}
 [bold]Events:[/] {self.event_count}
 [bold]Log Lines:[/] {len(self.log_lines)}
 

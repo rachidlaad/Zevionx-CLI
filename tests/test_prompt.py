@@ -27,6 +27,7 @@ uxarion_cli = _load_cli_module()
 FORBIDDEN_TERMS = ("verbosity", "internal telemetry")
 REQUIRED_CONTEXT_SECTIONS = (
     "Context_memory",
+    "Conversation_turn_context",
     "Deliverables_state",
     "Recent_step_briefs",
     "Last_command_result",
@@ -67,6 +68,31 @@ class PlannerRuntimeTests(unittest.TestCase):
             self.assertNotIn(term, prompt_lower)
         for section in REQUIRED_CONTEXT_SECTIONS:
             self.assertIn(section, captured["prompt"])
+
+    def test_request_decision_includes_conversation_turn_context(self) -> None:
+        policy = uxarion_cli.Policy()
+        agent = uxarion_cli.Agent(policy=policy, provider="openai")
+        captured = {}
+
+        def fake_chat_json(prompt: str, payload: dict, provider: str, **kwargs):
+            captured["prompt"] = prompt
+            return {"stop": True, "reason": "done"}
+
+        turn_context = {
+            "session_goal": "Web recon on localhost",
+            "recent_user_tasks": ["enumerate paths"],
+            "carry_over_notes": ["/robots.txt returned 200"],
+            "pending_items": ["check auth flow"],
+            "last_known_target": "localhost",
+        }
+
+        with mock.patch.object(uxarion_cli, "chat_json", side_effect=fake_chat_json):
+            agent._request_decision_direct("continue with auth checks", conversation_context=turn_context)
+
+        prompt = captured["prompt"]
+        self.assertIn("Conversation_turn_context", prompt)
+        self.assertIn("session_goal: Web recon on localhost", prompt)
+        self.assertIn("pending: check auth flow", prompt)
 
     def test_run_uses_context_memory(self) -> None:
         policy = uxarion_cli.Policy(dry_run=True)
@@ -206,7 +232,7 @@ class PlannerRuntimeTests(unittest.TestCase):
         self.assertEqual(result.get("report"), "Task completed with baseline reconnaissance results.")
         self.assertGreaterEqual(len(result.get("history", [])), 1)
         first_validator = result["history"][0].get("validator", {})
-        self.assertEqual(first_validator.get("reason"), "validation disabled")
+        self.assertEqual(first_validator.get("reason"), "prompt-governed direct mode")
 
     def test_duplicate_commands_are_not_blocked(self) -> None:
         policy = uxarion_cli.Policy(dry_run=True)

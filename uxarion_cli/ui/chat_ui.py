@@ -9,6 +9,7 @@ import os
 import subprocess
 import json
 import time
+import re
 from datetime import datetime
 from importlib import metadata
 from importlib.machinery import SourceFileLoader
@@ -54,6 +55,25 @@ class ConversationContext:
         self.messages: List[Dict[str, Any]] = []
         self.session_start = datetime.now()
         self.command_history: List[str] = []
+        self.session_goal: str = ""
+        self.recent_user_tasks: List[str] = []
+        self.recent_agent_replies: List[str] = []
+        self.carry_over_notes: List[str] = []
+        self.carry_over_findings: List[str] = []
+        self.pending_items: List[str] = []
+        self.last_known_target: str = ""
+
+    @staticmethod
+    def _append_unique(target: List[str], values: List[str], *, limit: int) -> None:
+        for value in values:
+            compact = " ".join((value or "").split()).strip()
+            if not compact:
+                continue
+            if any(existing.lower() == compact.lower() for existing in target):
+                continue
+            target.append(compact[:220])
+        if len(target) > limit:
+            del target[:-limit]
 
     def add_user_message(self, content: str):
         """Add user message to context"""
@@ -62,6 +82,9 @@ class ConversationContext:
             "content": content,
             "timestamp": datetime.now().isoformat()
         })
+        self._append_unique(self.recent_user_tasks, [content], limit=8)
+        if not self.session_goal:
+            self.session_goal = content
 
     def add_assistant_message(self, content: str):
         """Add assistant response to context"""
@@ -70,16 +93,59 @@ class ConversationContext:
             "content": content,
             "timestamp": datetime.now().isoformat()
         })
+        self._append_unique(self.recent_agent_replies, [content], limit=6)
 
-    def add_command_execution(self, command: str, output: str, returncode: int):
-        """Add command execution to context"""
+    def add_command_execution(
+        self,
+        command: str,
+        returncode: int,
+        *,
+        step_summary: str = "",
+        evidence: Optional[List[str]] = None,
+    ):
+        """Add command execution summary to context (no raw output retention)."""
         self.command_history.append(command)
+        note = f"{command} (rc={returncode})"
+        if step_summary:
+            note = f"{note}: {step_summary}"
+        self._append_unique(self.carry_over_notes, [note], limit=24)
+        self._append_unique(self.carry_over_findings, list(evidence or []), limit=20)
         self.messages.append({
             "role": "system",
-            "content": f"Command: {command}\nReturn code: {returncode}\nOutput:\n{output}",
+            "content": note,
             "timestamp": datetime.now().isoformat(),
             "type": "command_execution"
         })
+
+    def apply_run_result(self, objective: str, reply: str, result: Optional[Dict[str, Any]]) -> None:
+        if objective:
+            self._append_unique(self.recent_user_tasks, [objective], limit=8)
+            if not self.session_goal:
+                self.session_goal = objective
+        if reply:
+            self._append_unique(self.recent_agent_replies, [reply], limit=6)
+        if not isinstance(result, dict):
+            return
+
+        completed = [str(item) for item in result.get("completed_deliverables", []) if isinstance(item, str)]
+        blocked = [str(item) for item in result.get("blocked_deliverables", []) if isinstance(item, str)]
+        next_focus = [str(item) for item in result.get("next_focus", []) if isinstance(item, str)]
+        notes = [str(item) for item in result.get("context_notes", []) if isinstance(item, str)]
+
+        self._append_unique(self.carry_over_notes, notes[-10:], limit=24)
+        self._append_unique(self.carry_over_findings, completed[-8:] + blocked[-6:], limit=20)
+        self.pending_items = next_focus[-12:]
+
+    def as_agent_context(self) -> Dict[str, Any]:
+        return {
+            "session_goal": self.session_goal,
+            "recent_user_tasks": self.recent_user_tasks[-6:],
+            "recent_agent_replies": self.recent_agent_replies[-4:],
+            "carry_over_notes": self.carry_over_notes[-16:],
+            "carry_over_findings": self.carry_over_findings[-12:],
+            "pending_items": self.pending_items[-12:],
+            "last_known_target": self.last_known_target,
+        }
 
     def get_recent_context(self, max_messages: int = 10) -> List[Dict[str, Any]]:
         """Get recent conversation context"""
@@ -105,7 +171,7 @@ class ChatUI:
         self.objective = "Security assessment"
         self.provider = "openai"
         self.enable_advanced = False
-        self.prompt_template = "[cyan]>[/] "
+        self.prompt_template = "> "
 
     def _resolve_build_metadata(self) -> tuple[str, str]:
         """Return package version and build identifier."""
@@ -235,10 +301,13 @@ class ChatUI:
         cleaned = message.strip()
         if not cleaned:
             return
+        target_hint = self._extract_target_hint(cleaned)
+        if target_hint:
+            self.context.last_known_target = target_hint
         try:
             reply = asyncio.run(self._run_agent_session(cleaned))
             if reply:
-                self.console.print(Panel(reply, border_style="green", title="Reply", padding=(1, 2)))
+                self.console.print(reply)
                 self.context.add_assistant_message(reply)
             else:
                 self.context.add_assistant_message("No reply generated.")
@@ -255,30 +324,24 @@ class ChatUI:
         orchestrator = init_orchestrator(provider="openai")
         target = self._normalized_target()
         allow_tools = {"sqlmap", "nmap", "gobuster", "nikto"} if self.enable_advanced else None
+        conversation_context = self.context.as_agent_context()
         session_id = orchestrator.create_session(
             objective,
             target,
             allow_tools=allow_tools,
+            conversation_context=conversation_context,
             loop_mode="direct",
         )
         final_report: Optional[str] = None
+        final_result: Optional[Dict[str, Any]] = None
         spinner_index = 0
-        spinner_text = "Running..."
-        gradient = ["#6d28d9", "#8b5cf6", "#a855f7", "#c084fc", "#a855f7", "#8b5cf6"]
-
-        def render_spinner(idx: int) -> str:
-            parts = []
-            for pos, char in enumerate(spinner_text):
-                offset = (pos - idx) % len(gradient)
-                color = gradient[offset]
-                parts.append(f"[{color}]{char}[/{color}]")
-            return "".join(parts)
+        spinner_frames = ["|", "/", "-", "\\"]
 
         async def spinner_task(stop_event: asyncio.Event, live: Live) -> None:
             nonlocal spinner_index
             while not stop_event.is_set():
-                live.update(render_spinner(spinner_index))
-                spinner_index = (spinner_index + 1) % len(spinner_text)
+                live.update(f"[dim]running {spinner_frames[spinner_index]}[/]")
+                spinner_index = (spinner_index + 1) % len(spinner_frames)
                 await asyncio.sleep(0.16)
 
         with Live(console=self.console, transient=True, refresh_per_second=10) as live:
@@ -290,14 +353,22 @@ class ChatUI:
 
                 if event.get("type") == "observation":
                     obs = event.get("observation", {})
+                    context_summary = obs.get("context_summary", {}) if isinstance(obs, dict) else {}
+                    step_summary = context_summary.get("step_summary", "") if isinstance(context_summary, dict) else ""
                     self.context.add_command_execution(
                         obs.get("command", ""),
-                        obs.get("output", "") or "",
                         obs.get("returncode", 0),
+                        step_summary=step_summary,
+                        evidence=obs.get("evidence", []),
                     )
 
                 if report_candidate:
                     final_report = report_candidate
+
+                if event.get("type") == "completed":
+                    result_payload = event.get("result")
+                    if isinstance(result_payload, dict):
+                        final_result = result_payload
 
                 if event.get("type") in {"completed", "error"} and not spinner_stopped:
                     stop_event.set()
@@ -315,6 +386,7 @@ class ChatUI:
                 stop_event.set()
                 await spinner_handle
                 live.update("")
+        self.context.apply_run_result(objective, final_report or "", final_result)
         return final_report
 
     def _format_event_for_display(self, event: Dict[str, Any]) -> tuple[Optional[Any], Optional[str]]:
@@ -327,7 +399,7 @@ class ChatUI:
             command = event.get("command", "")
             reason = event.get("reason", "")
             return [
-                f"[bright_cyan]Command:[/] {command}",
+                f"[bright_cyan]> {command}[/]",
                 f"[grey58]   {reason}[/]" if reason else "",
             ], None
         if etype == "output":
@@ -346,7 +418,6 @@ class ChatUI:
             ], None
         if etype == "observation":
             obs = event.get("observation", {})
-            command = obs.get("command", "")
             rc = obs.get("returncode", "")
             duration_value = obs.get("duration")
             if isinstance(duration_value, (int, float)):
@@ -356,8 +427,7 @@ class ChatUI:
             snippet = (obs.get("output", "") or "").splitlines()
             display = snippet[0][:120] if snippet else ""
             lines = [
-                f"[green]Executed[/]: {command}",
-                f"[grey58]   rc={rc} duration={duration}[/]" if duration else f"[grey58]   rc={rc}[/]",
+                f"[grey58]rc={rc} duration={duration}[/]" if duration else f"[grey58]rc={rc}[/]",
             ]
             if display:
                 lines.append(f"[grey62]   {display}[/]")
@@ -379,6 +449,19 @@ class ChatUI:
             parsed = urlparse(self.target)
             return parsed.hostname or self.target
         return self.target
+
+    def _extract_target_hint(self, text: str) -> Optional[str]:
+        url_match = re.search(r"https?://([A-Za-z0-9\.\-]+)", text)
+        if url_match:
+            return url_match.group(1).strip().lower()
+
+        host_match = re.search(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", text)
+        if host_match:
+            return host_match.group(0).strip().lower()
+
+        if "localhost" in text.lower():
+            return "localhost"
+        return None
 
     def _execute_command(self, command: str):
         """Execute shell command and display results"""
@@ -512,9 +595,7 @@ class ChatUI:
         try:
             reply = asyncio.run(self._run_agent_session(self.objective))
             if reply:
-                self.console.print(
-                    Panel(reply, border_style="green", title="Reply", padding=(1, 2))
-                )
+                self.console.print(reply)
                 self.context.add_assistant_message(reply)
             else:
                 self.context.add_assistant_message("Session completed without a reply.")

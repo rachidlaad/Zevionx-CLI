@@ -19,6 +19,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Set
+from urllib.parse import urlsplit
 
 try:
     from rich.console import Console
@@ -58,13 +59,27 @@ openai_client = None
 DEFAULT_PROVIDER = "openai"
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.2")
 OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "high")
+OPENAI_DECISION_REASONING_EFFORT = os.environ.get(
+    "OPENAI_DECISION_REASONING_EFFORT",
+    os.environ.get("OPENAI_REASONING_EFFORT", "medium"),
+)
+OPENAI_CONTEXT_REASONING_EFFORT = os.environ.get("OPENAI_CONTEXT_REASONING_EFFORT", "low")
+OPENAI_REPORT_REASONING_EFFORT = os.environ.get(
+    "OPENAI_REPORT_REASONING_EFFORT",
+    os.environ.get("OPENAI_REASONING_EFFORT", "medium"),
+)
+OPENAI_DIRECT_REPLY_REASONING_EFFORT = os.environ.get(
+    "OPENAI_DIRECT_REPLY_REASONING_EFFORT",
+    os.environ.get("OPENAI_REASONING_EFFORT", "low"),
+)
 
-DEFAULT_TIMEOUT_S = 600
+DEFAULT_TIMEOUT_S = 300
 MIN_TIMEOUT_S = 10
 MAX_TIMEOUT_S = 3600
 IDLE_TIMEOUT_S = 180
 MAX_STREAM_LINE_CHARS = 400
 MAX_STREAM_CAPTURE_LINES = 1200
+MAX_STREAM_EMIT_LINES = 260
 WALL_CLOCK_LIMIT_S: Optional[int] = None
 SCHEMA_VERSION = "1.0"
 LOOP_MODE_DIRECT = "direct"
@@ -153,7 +168,7 @@ def stream_command_execution(
 ) -> Dict[str, Any]:
     """Run a shell command and stream output to stdout."""
     if emit_console:
-        print(f"\ncmd> {command}")
+        print(f"\n> {command}")
         print("\033[90m" + "─" * 80 + "\033[0m")
 
     proc: Optional[subprocess.Popen[str]] = None
@@ -184,6 +199,8 @@ def stream_command_execution(
         last_line_time = start
         repeat_count = 0
         suppress_until = 0.0
+        emitted_lines = 0
+        emit_truncated_notice = False
         while True:
             now = time.time()
             if timeout and (now - start) > timeout:
@@ -195,7 +212,7 @@ def stream_command_execution(
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     termination_reason = "timeout_killed"
                 if emit_console:
-                    print(f"\033[91m⏰ Command timed out after {timeout}s\033[0m")
+                    print(f"\033[91mCommand timed out after {timeout}s\033[0m")
                 break
 
             line = proc.stdout.readline() if proc.stdout else ""
@@ -210,11 +227,25 @@ def stream_command_execution(
                 elif not capture_truncated:
                     output_lines.append(f"... (output truncated after {MAX_STREAM_CAPTURE_LINES} lines) ...")
                     capture_truncated = True
-                if line_callback:
-                    try:
-                        line_callback(clean)
-                    except Exception:
-                        pass
+                if emitted_lines < MAX_STREAM_EMIT_LINES:
+                    if line_callback:
+                        try:
+                            line_callback(clean)
+                        except Exception:
+                            pass
+                    if emit_console:
+                        print(f"\033[90m{clean}\033[0m")
+                    emitted_lines += 1
+                elif not emit_truncated_notice:
+                    notice = f"... (live output truncated after {MAX_STREAM_EMIT_LINES} lines) ..."
+                    if line_callback:
+                        try:
+                            line_callback(notice)
+                        except Exception:
+                            pass
+                    if emit_console:
+                        print(f"\033[90m{notice}\033[0m")
+                    emit_truncated_notice = True
                 if clean == last_line and (now - last_line_time) < 2.0:
                     repeat_count += 1
                     if repeat_count > 5:
@@ -228,20 +259,18 @@ def stream_command_execution(
                     repeat_count = 0
                     last_line = clean
                     last_line_time = now
-                if emit_console:
-                    print(f"\033[90m{clean}\033[0m")
                 last_output = now
 
             if idle_timeout and (now - last_output) > idle_timeout:
                 try:
                     if emit_console:
-                        print(f"\033[91m🔕 No output for {idle_timeout}s — sending SIGINT\033[0m")
+                        print(f"\033[91mNo output for {idle_timeout}s - sending SIGINT\033[0m")
                     os.killpg(os.getpgid(proc.pid), signal.SIGINT)
                     proc.wait(timeout=8)
                     termination_reason = "idle"
                 except Exception:
                     if emit_console:
-                        print("\033[91m💀 Escalating to SIGKILL\033[0m")
+                        print("\033[91mEscalating to SIGKILL\033[0m")
                     os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                     termination_reason = "idle_killed"
                 break
@@ -436,7 +465,8 @@ def load_api_keys() -> Dict[str, str]:
         pass
 
     env_openai = os.getenv("OPENAI_API_KEY")
-    if env_openai and "openai" not in keys:
+    # Environment value must override .env for testability and runtime overrides.
+    if env_openai:
         keys["openai"] = env_openai
     return keys
 
@@ -566,9 +596,9 @@ def _suggest_timeout_for(cmd: str) -> int:
     category = _classify_command(cmd)
     return {
         "http_probe_fast": 60,
-        "content_enum": 600,
-        "deep_scan": 1200,
-        "automated_injection": 1500,
+        "content_enum": 300,
+        "deep_scan": 300,
+        "automated_injection": 600,
         "generic": DEFAULT_TIMEOUT_S,
     }[category]
 
@@ -600,12 +630,23 @@ def _should_prefix_stdbuf(command: str, tool_name: str, *, has_stdbuf: bool) -> 
 # ----------------------------------------------------------------------------
 
 
-def chat_json_openai(system: str, payload: Dict[str, Any], model: str = OPENAI_MODEL) -> Dict[str, Any]:
+def _normalize_reasoning_effort(value: Optional[str], *, default: str = "medium") -> str:
+    candidate = (value or default).strip().lower() or default
+    if candidate not in {"none", "low", "medium", "high", "xhigh"}:
+        return default
+    return candidate
+
+
+def chat_json_openai(
+    system: str,
+    payload: Dict[str, Any],
+    model: str = OPENAI_MODEL,
+    *,
+    reasoning_effort: Optional[str] = None,
+) -> Dict[str, Any]:
     client = get_openai_client()
     user_payload = json.dumps(payload, indent=2)
-    reasoning_effort = OPENAI_REASONING_EFFORT.strip().lower() or "high"
-    if reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
-        reasoning_effort = "high"
+    effort = _normalize_reasoning_effort(reasoning_effort, default="medium")
     try:
         resp = client.responses.create(
             model=model,
@@ -614,7 +655,7 @@ def chat_json_openai(system: str, payload: Dict[str, Any], model: str = OPENAI_M
                 {"role": "user", "content": user_payload},
             ],
             max_output_tokens=2000,
-            reasoning={"effort": reasoning_effort},
+            reasoning={"effort": effort},
             text={
                 "verbosity": "low",
                 "format": {"type": "json_object"},
@@ -643,12 +684,16 @@ def chat_json_openai(system: str, payload: Dict[str, Any], model: str = OPENAI_M
             raise RuntimeError(f"OpenAI JSON completion failed: {fallback_exc}") from exc
 
 
-def chat_text_openai(system: str, payload: Dict[str, Any], model: str = OPENAI_MODEL) -> str:
+def chat_text_openai(
+    system: str,
+    payload: Dict[str, Any],
+    model: str = OPENAI_MODEL,
+    *,
+    reasoning_effort: Optional[str] = None,
+) -> str:
     client = get_openai_client()
     user_payload = json.dumps(payload, indent=2)
-    reasoning_effort = OPENAI_REASONING_EFFORT.strip().lower() or "high"
-    if reasoning_effort not in {"none", "low", "medium", "high", "xhigh"}:
-        reasoning_effort = "high"
+    effort = _normalize_reasoning_effort(reasoning_effort, default="low")
     try:
         resp = client.responses.create(
             model=model,
@@ -657,7 +702,7 @@ def chat_text_openai(system: str, payload: Dict[str, Any], model: str = OPENAI_M
                 {"role": "user", "content": user_payload},
             ],
             max_output_tokens=2200,
-            reasoning={"effort": reasoning_effort},
+            reasoning={"effort": effort},
             text={"verbosity": "low"},
             timeout=30,
         )
@@ -697,8 +742,9 @@ def chat_json(
     payload: Dict[str, Any],
     provider: str = DEFAULT_PROVIDER,
     *,
-    retries: int = 10,
-    backoff_seconds: float = 1.0,
+    retries: int = 2,
+    backoff_seconds: float = 0.8,
+    reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
     normalized_provider = (provider or DEFAULT_PROVIDER).strip().lower()
     if normalized_provider != DEFAULT_PROVIDER:
@@ -706,7 +752,7 @@ def chat_json(
     last_error: Optional[Exception] = None
     for attempt in range(1, retries + 1):
         try:
-            return chat_json_openai(system, payload)
+            return chat_json_openai(system, payload, reasoning_effort=reasoning_effort)
         except Exception as exc:  # noqa: PERF203
             last_error = exc
             if attempt == retries:
@@ -717,11 +763,17 @@ def chat_json(
     ) from last_error
 
 
-def chat_text(system: str, payload: Dict[str, Any], provider: str = DEFAULT_PROVIDER) -> str:
+def chat_text(
+    system: str,
+    payload: Dict[str, Any],
+    provider: str = DEFAULT_PROVIDER,
+    *,
+    reasoning_effort: Optional[str] = None,
+) -> str:
     normalized_provider = (provider or DEFAULT_PROVIDER).strip().lower()
     if normalized_provider != DEFAULT_PROVIDER:
         raise RuntimeError(f"Unsupported provider '{provider}'. Only '{DEFAULT_PROVIDER}' is available.")
-    return chat_text_openai(system, payload)
+    return chat_text_openai(system, payload, reasoning_effort=reasoning_effort)
 
 
 # ----------------------------------------------------------------------------
@@ -848,26 +900,6 @@ def summarize_for_report(history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         )
     return summary
 
-def detect_header_vulns(command: str, output: str, *, scheme: str = "http") -> Optional[List[str]]:
-    lowered_cmd = command.lower()
-    if "curl -i" not in lowered_cmd:
-        return None
-    if not (
-        re.search(r"^HTTP/\d\.\d\s+\d{3}", output, re.MULTILINE)
-        or re.search(r"^[A-Za-z-]+:\s", output, re.MULTILINE)
-    ):
-        return None
-    headers = output.lower()
-    missing = []
-    if "x-frame-options" not in headers:
-        missing.append("X-Frame-Options")
-    if "content-security-policy" not in headers:
-        missing.append("Content-Security-Policy")
-    if scheme == "https" and "strict-transport-security" not in headers:
-        missing.append("Strict-Transport-Security")
-    return missing if missing else None
-
-
 def should_finish(decision: Dict[str, Any], observation: Dict[str, Any]) -> bool:
     phase = (decision.get("phase") or "").lower()
     if phase == "report":
@@ -963,6 +995,25 @@ def command_signature(cmd: str) -> str:
     return f"{tool}::{args}"
 
 
+def command_family(cmd: str) -> str:
+    try:
+        parts = shlex.split(cmd)
+    except Exception:
+        parts = cmd.strip().split()
+    if not parts:
+        return "unknown"
+    tool = parts[0]
+    for token in parts[1:]:
+        if token.startswith("http://") or token.startswith("https://"):
+            parsed = urlsplit(token)
+            path_segments = [seg for seg in parsed.path.split("/") if seg]
+            path_hint = "/"
+            if path_segments:
+                path_hint = "/" + "/".join(path_segments[:2])
+            return f"{tool} {parsed.scheme}://{parsed.netloc}{path_hint}"
+    return tool
+
+
 # ----------------------------------------------------------------------------
 # Agent implementation
 # ----------------------------------------------------------------------------
@@ -993,11 +1044,17 @@ Available_tools:
 Context_memory (high-value notes from prior steps):
 {context_memory}
 
+Conversation_turn_context (carry-over memory from earlier user turns):
+{conversation_turn_context}
+
 Deliverables_state:
 {deliverables_state}
 
 Recent_step_briefs (newest first):
 {recent_step_briefs}
+
+Recent_command_families (latest grouping to avoid redundant steps):
+{recent_command_families}
 
 Last_command_result:
 {last_command_result}
@@ -1013,17 +1070,30 @@ Timeout_seconds:
 
 Rules:
 1. Return exactly one command when stop=false.
-2. Base the next action on Last_command_result, Last_command_output, and Context_memory.
+2. Base the next action on Last_command_result, Last_command_output, Context_memory, Deliverables_state, and Recent_command_families.
 3. Do not stop until requested deliverables are completed with evidence or explicitly blocked with reason.
 4. Do not ask again for target/input if it already exists in task or context.
 5. Keep commands non-interactive and fully specified.
-6. If a deliverable is already completed in Deliverables_state, do not run the same deliverable again unless prior evidence is invalid/conflicting.
-7. Keep output bounded and focused. Prefer compact evidence extraction (headers/status/selected lines) over full document dumps.
-8. Use POSIX-compatible shell syntax; avoid placeholders.
-9. Prefer atomic commands that target one deliverable at a time; avoid long nested-quote scripts unless unavoidable.
-10. If the user input is a plain question, greeting, explanation request, or planning request that does not require running shell commands, return stop=true immediately with a direct final_reply.
-11. For command-based security tasks, final_reply should be concise, practical, and grounded in observed evidence.
-12. Do not mention internal orchestration, loop state, hidden memory, or schema rules.
+6. Use robust shell syntax. Avoid brittle quoting and avoid `set -e` on pipelines that may return non-zero (for example grep/head with no matches) unless explicitly guarded.
+7. Keep each command bounded and safe: limit endpoints per command, bound output (`head`/selected lines), and prefer request timeouts (for example `curl --max-time`).
+8. Prefer atomic commands that target one unmet deliverable at a time. Avoid long nested scripts unless unavoidable.
+9. If target is an explicit HTTP(S) URL/port and deliverables are web-focused, prioritize HTTP-level probes first. Avoid broad port/service scans unless a specific gap requires it.
+10. If using scan/enumeration tools (for example nmap/ffuf/sqlmap), include explicit runtime bounds (`--max-time`, `--maxtime`, `--host-timeout`, low thread/rate) so each step completes quickly.
+11. If a deliverable is already completed in Deliverables_state, do not rerun it unless evidence is conflicting or stale.
+12. Do not repeat the same command family unless there is a clear delta (different method, path cluster, protocol/port, or auth/cookie context). If repeated, explain the delta in `reason`.
+13. If the previous command failed, run one minimal corrective step next; do not restart broad enumeration.
+14. Keep output focused. Prefer compact evidence extraction (status/headers/selected lines) over full document dumps.
+15. Use POSIX-compatible shell syntax; avoid placeholders.
+16. If the user input is a plain question, greeting, explanation request, or planning request that does not require running shell commands, return stop=true immediately with a direct final_reply.
+17. For command-based security tasks, final_reply must be practical and grounded in observed evidence and should follow requested output structure when provided.
+18. Do not mention internal orchestration, loop state, hidden memory, or schema rules.
+19. Do not use emojis in final_reply unless the user explicitly asks for them.
+20. If the user references previous work (for example: "continue", "next", "retest that"), resolve it from Conversation_turn_context without asking to restart from zero.
+21. Keep follow-up actions incremental: prefer the smallest next command that advances unresolved items.
+22. Be command-efficient: for routine micro-tasks aim to finish in a small number of high-signal commands, then stop with a clear reply.
+23. For Python one-liners/scripts, prefer `python3` unless `python` is explicitly confirmed available.
+24. Do not jump to heavyweight scanners (for example `nikto`, `nmap`, `whatweb`, `ffuf`) unless the user explicitly asks for them or a specific evidence gap requires them.
+25. Stay strictly in-scope; avoid external lookups or third-party endpoints unless required for the user task.
 
 Return valid JSON only."""
 
@@ -1106,7 +1176,7 @@ class Agent:
 
         if self.policy.dry_run:
             if emit_console:
-                print(f"\ncmd> {command}")
+                print(f"\n> {command}")
             return {
                 "command": command,
                 "original_command": command,
@@ -1159,6 +1229,41 @@ class Agent:
             return "(none)"
         return "\n".join(f"- {item}" for item in notes)
 
+    def _conversation_turn_context_text(self, conversation_context: Optional[Dict[str, Any]]) -> str:
+        if not conversation_context or not isinstance(conversation_context, dict):
+            return "(none)"
+
+        lines: List[str] = []
+
+        def _append_line(label: str, value: str) -> None:
+            normalized = _normalize_short_line(value, limit=220)
+            if normalized:
+                lines.append(f"- {label}: {normalized}")
+
+        target = conversation_context.get("last_known_target")
+        if isinstance(target, str) and target.strip():
+            _append_line("target", target)
+
+        session_goal = conversation_context.get("session_goal")
+        if isinstance(session_goal, str) and session_goal.strip():
+            _append_line("session_goal", session_goal)
+
+        for key, label, cap in (
+            ("recent_user_tasks", "user_task", 4),
+            ("recent_agent_replies", "assistant_reply", 3),
+            ("carry_over_notes", "note", 8),
+            ("carry_over_findings", "finding", 6),
+            ("pending_items", "pending", 8),
+        ):
+            values = conversation_context.get(key, [])
+            if not isinstance(values, list):
+                continue
+            for item in values[-cap:]:
+                if isinstance(item, str) and item.strip():
+                    _append_line(label, item)
+
+        return "\n".join(lines) if lines else "(none)"
+
     def _recent_step_briefs(self, limit: int = 8) -> str:
         lines: List[str] = []
         for entry in reversed(self.memory.history[-limit:]):
@@ -1175,6 +1280,26 @@ class Agent:
             summary = _normalize_short_line(summary, limit=140) or "no summary"
             lines.append(f"- {command} :: {summary}")
         return "\n".join(lines) if lines else "(none)"
+
+    def _recent_command_families(self, limit: int = 10) -> str:
+        counts: Dict[str, int] = {}
+        last_cmd_for_family: Dict[str, str] = {}
+        for entry in self.memory.history[-limit:]:
+            observation = entry.get("observation", {}) or {}
+            command = (observation.get("command") or "").strip()
+            if not command:
+                continue
+            family = command_family(command)
+            counts[family] = counts.get(family, 0) + 1
+            last_cmd_for_family[family] = _normalize_short_line(command, limit=120) or command[:120]
+        if not counts:
+            return "(none)"
+        ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+        lines = [
+            f"- {family} :: count={count} :: last={last_cmd_for_family.get(family, '')}"
+            for family, count in ordered[:8]
+        ]
+        return "\n".join(lines)
 
     def _last_command_result(self) -> Dict[str, Any]:
         if not self.memory.history:
@@ -1204,6 +1329,7 @@ class Agent:
         user_task: str,
         tools_hint: str = "",
         *,
+        conversation_context: Optional[Dict[str, Any]] = None,
         terminal_capabilities: Optional[Dict[str, Any]] = None,
         timeout_seconds: Optional[int] = None,
     ) -> Dict[str, Any]:
@@ -1211,14 +1337,21 @@ class Agent:
             user_task=user_task.rstrip(),
             tools_hint=tools_hint or "none detected",
             context_memory=self._context_memory_text(),
+            conversation_turn_context=self._conversation_turn_context_text(conversation_context),
             deliverables_state=self._context_text(self._deliverables_state()),
             recent_step_briefs=self._recent_step_briefs(),
+            recent_command_families=self._recent_command_families(),
             last_command_result=self._context_text(self._last_command_result()),
             last_command_output=self._last_command_output(),
             terminal_capabilities=self._context_text(terminal_capabilities),
             timeout_seconds=self._context_text(timeout_seconds),
         )
-        return chat_json(prompt, {}, self.provider)
+        return chat_json(
+            prompt,
+            {},
+            self.provider,
+            reasoning_effort=OPENAI_DECISION_REASONING_EFFORT,
+        )
 
     def _fallback_step_context(self, observation: Dict[str, Any]) -> Dict[str, Any]:
         output = observation.get("output", "") or ""
@@ -1266,6 +1399,7 @@ class Agent:
                 self.provider,
                 retries=3,
                 backoff_seconds=0.5,
+                reasoning_effort=OPENAI_CONTEXT_REASONING_EFFORT,
             )
         except Exception:
             return self._fallback_step_context(observation)
@@ -1364,14 +1498,24 @@ class Agent:
             "evidence": evidence_lines,
             "execution_mode": execution_mode,
         }
-        report_text = chat_text(REPORT_PROMPT, payload, self.provider)
+        report_text = chat_text(
+            REPORT_PROMPT,
+            payload,
+            self.provider,
+            reasoning_effort=OPENAI_REPORT_REASONING_EFFORT,
+        )
         if not report_text:
             raise RuntimeError("Report generation returned an empty response.")
         return report_text.strip()
 
     def _generate_direct_reply(self, user_text: str) -> str:
         payload = {"user_text": user_text}
-        reply = chat_text(DIRECT_REPLY_PROMPT, payload, self.provider)
+        reply = chat_text(
+            DIRECT_REPLY_PROMPT,
+            payload,
+            self.provider,
+            reasoning_effort=OPENAI_DIRECT_REPLY_REASONING_EFFORT,
+        )
         if not reply:
             raise RuntimeError("Direct reply generation returned an empty response.")
         return reply.strip()
@@ -1390,6 +1534,7 @@ class Agent:
         report_out_path: Optional[str] = None,
         validate: bool = True,
         loop_mode: Optional[str] = None,
+        conversation_context: Optional[Dict[str, Any]] = None,
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         run_id = uuid.uuid4().hex
@@ -1399,8 +1544,7 @@ class Agent:
         intent_paragraph = user_prompt.strip()
         emit_console = event_callback is None
         if emit_console:
-            print(f"\n🎯 Intent: {intent_paragraph}\n")
-            print("⚙️ Loop mode: direct (verbatim task executor)\n")
+            print(f"\n{intent_paragraph}\n")
         self._push_event(
             event_callback,
             {
@@ -1434,6 +1578,7 @@ class Agent:
         _ = deny_tools
         _ = scope_cidrs
         _ = validate
+        # Direct loop remains prompt-governed; command hard-blocking stays disabled.
         validate_commands = False
 
         has_stdbuf = shutil.which("stdbuf") is not None
@@ -1480,7 +1625,7 @@ class Agent:
         while True:
             if WALL_CLOCK_LIMIT_S and time.time() - start_time > WALL_CLOCK_LIMIT_S:
                 if emit_console:
-                    print("⏳ Wall clock limit reached, wrapping up.")
+                    print("Wall clock limit reached, wrapping up.")
                 stop_reason = f"wall-clock limit ({WALL_CLOCK_LIMIT_S}s) reached"
                 break
 
@@ -1490,6 +1635,7 @@ class Agent:
                 decision = self._request_decision_direct(
                     user_intent_text,
                     tools_hint,
+                    conversation_context=conversation_context,
                     terminal_capabilities=terminal_capabilities,
                     timeout_seconds=timeout_seconds_context,
                 )
@@ -1559,7 +1705,7 @@ class Agent:
                 },
             )
 
-            validator_record = {"ok": True, "reason": "validation disabled", "risk": 0.0}
+            validator_record = {"ok": True, "reason": "prompt-governed direct mode", "risk": 0.0}
             if validate_commands:
                 validator_record["reason"] = "validation disabled by direct execution loop"
 
@@ -1575,7 +1721,7 @@ class Agent:
                 thought_line = thought_line[:157] + "…"
             if emit_console:
                 print(f"thinking: {thought_line}")
-                print(f"→ {command}")
+                print(f"> {command}")
 
             def _line_event(line: str) -> None:
                 self._push_event(
@@ -1614,20 +1760,6 @@ class Agent:
 
             is_live_obs = observation.get("termination_reason") not in {"dry-run", "error"}
             if is_live_obs:
-                cmd_text = observation.get("command", "") or ""
-                scheme_hint = "https" if "https://" in cmd_text else "http"
-                header_issues = detect_header_vulns(
-                    cmd_text,
-                    observation.get("output", ""),
-                    scheme=scheme_hint,
-                )
-                if header_issues:
-                    issue_text = ", ".join(header_issues)
-                    if emit_console:
-                        print(f" HEADER VULNERABILITY DETECTED! Missing Security Headers: {issue_text}")
-                    finding = f"Missing security headers ({issue_text}) identified via {observation.get('command')}"
-                    if finding not in self.memory.discovered_vulns:
-                        self.memory.discovered_vulns.append(finding)
                 observation["evidence"] = extract_evidence(observation.get("output", ""))
             else:
                 observation["evidence"] = []
@@ -1682,14 +1814,14 @@ class Agent:
                         jf.write(json.dumps(jsonl_entry, ensure_ascii=False) + "\n")
                 except Exception as exc:
                     if emit_console:
-                        print(f"⚠️ JSONL write failed: {exc}")
+                        print(f"warning: JSONL write failed: {exc}")
 
             if exit_on_first_finding and self.memory.discovered_vulns:
                 stop_reason = "first finding observed"
                 break
             if hard_cap is not None and executed >= hard_cap:
                 if emit_console:
-                    print(f"🏁 Command budget reached (executed {executed}/{hard_cap}).")
+                    print(f"Command budget reached (executed {executed}/{hard_cap}).")
                 stop_reason = f"command budget used ({executed}/{hard_cap})"
                 break
 
@@ -1745,14 +1877,6 @@ class Agent:
             "report_path": os.path.abspath(report_path),
             "run_result_path": os.path.abspath(run_result_path_session),
         }
-        saved_result_path: Optional[str] = None
-        try:
-            with open("run_result.json", "w", encoding="utf-8") as handle:
-                json.dump(result, handle, indent=2)
-            saved_result_path = os.path.abspath("run_result.json")
-        except Exception as exc:
-            if emit_console:
-                print(f"error: failed to write run_result.json ({exc})")
 
         try:
             with open(run_result_path_session, "w", encoding="utf-8") as handle:
@@ -1761,10 +1885,8 @@ class Agent:
             if emit_console:
                 print(f"error: failed to write session run_result ({exc})")
 
-        if not saved_paths and saved_result_path:
-            saved_paths.append(saved_result_path)
         if saved_paths and emit_console:
-            print(f"💾 saved: {saved_paths[0]}")
+            print(f"saved: {saved_paths[0]}")
         self._push_event(
             event_callback,
             {
@@ -1800,42 +1922,14 @@ class CLIEventPrinter:
             if message:
                 self._console_print(f"[dim]{message}[/dim]" if self.console else _color(message, DIM))
         elif etype == "intent":
-            self._console_print(f"[magenta]{self.sep}[/magenta]" if self.console else self.sep)
-            intent = event.get("intent", "")
-            if intent:
-                if self.console:
-                    self.console.print(f"[cyan]🎯 Intent:[/] {intent}")
-                else:
-                    print(_color("🎯 Intent:", Fore.CYAN) + f" {intent}")
-            assumptions = event.get("assumptions") or []
-            if assumptions:
-                if self.console:
-                    self.console.print("[dim]Assumptions:[/dim]")
-                    for item in assumptions:
-                        self.console.print(f"  [dim]- {item}[/dim]")
-                else:
-                    print(_color("Assumptions:", DIM))
-                    for item in assumptions:
-                        print(_color(f"  - {item}", DIM))
-            derived = event.get("derived_targets") or []
-            if derived:
-                if self.console:
-                    self.console.print(f"[cyan]Targets:[/] {', '.join(derived)}")
-                else:
-                    print(_color("Targets:", Fore.CYAN) + f" {', '.join(derived)}")
+            return
         elif etype == "decision":
-            reason = (event.get("reason") or "").splitlines()[0]
-            if reason:
-                if self.console:
-                    self.console.print(f"[dim]thinking: {reason}[/dim]")
-                else:
-                    print(_color(f"thinking: {reason}", DIM))
             command = event.get("command")
             if command:
                 if self.console:
-                    self.console.print(f"[yellow]→ {command}[/yellow]")
+                    self.console.print(f"[yellow]> {command}[/yellow]")
                 else:
-                    print(_color(f"→ {command}", Fore.YELLOW))
+                    print(_color(f"> {command}", Fore.YELLOW))
         elif etype == "output":
             line = (event.get("line") or "").strip()
             if line:
@@ -1845,48 +1939,24 @@ class CLIEventPrinter:
                     print(_color(line, DIM))
         elif etype == "observation":
             obs = event.get("observation", {})
-            command = obs.get("command", "")
             rc = obs.get("returncode")
-            duration = obs.get("duration")
-            self._console_print(f"[magenta]{self.sep}[/magenta]" if self.console else self.sep)
-            summary = f"rc={rc}" if rc is not None else ""
-            if duration not in (None, ""):
-                summary = f"{summary} | {duration}s" if summary else f"{duration}s"
-            info = f" ({summary})" if summary else ""
-            if self.console:
-                self.console.print(f"[green]✓ {command}{info}[/green]")
-            else:
-                print(_color(f"✓ {command}{info}", Fore.GREEN))
-            output = obs.get("output") or ""
-            first_line = next((line for line in output.splitlines() if line.strip()), "")
-            if first_line:
+            if rc not in (None, 0):
+                message = f"command failed (rc={rc})"
                 if self.console:
-                    self.console.print(f"[blue]{first_line[:160]}[/blue]")
+                    self.console.print(f"[red]{message}[/red]")
                 else:
-                    print(_color(first_line[:160], Fore.BLUE))
-            evidence = obs.get("evidence") or []
-            if evidence:
-                if self.console:
-                    self.console.print(f"[magenta]evidence:[/] {', '.join(evidence)}")
-                else:
-                    print(_color("evidence:", Fore.MAGENTA) + f" {', '.join(evidence)}")
+                    print(_color(message, Fore.RED))
         elif etype == "report":
             report = event.get("report", "")
             if report:
-                self._console_print(f"[magenta]{self.sep}[/magenta]" if self.console else self.sep)
                 if self.console:
-                    self.console.print("[green]🧾 Report:[/green]")
+                    self.console.print("[green]Reply:[/green]")
                     self.console.print(report)
                 else:
-                    print(_color("🧾 Report:", Fore.GREEN))
+                    print(_color("Reply:", Fore.GREEN))
                     print(report)
         elif etype == "completed":
-            reason = event.get("stop_reason") or event.get("result", {}).get("stop_reason", "")
-            if reason:
-                if self.console:
-                    self.console.print(f"[cyan]Mission complete:[/] {reason}")
-                else:
-                    print(_color(f"Mission complete: {reason}", Fore.CYAN))
+            return
         elif etype == "error":
             if self.console:
                 self.console.print(f"[red]error:[/] {event.get('error', 'unknown error')}")
@@ -1899,10 +1969,9 @@ def print_banner() -> None:
         "                     Uxarion CLI",
         "",
     ]
-    builder_line = "I would be happy for you to connect, collaborate, fix a bug or add a feature to the tool 😊"
-    contacts_line = "X.com > @Rachid_LLLL    Gmail > rachidshade@gmail.com    GitHub > https://github.com/rachidlaad"
+    builder_line = "Open-source AI pentesting copilot for authorized security testing."
     mission_line = "Uxarion is an AI pentesting copilot, open-source for the pentesting community."
-    quick_actions_line = "Tip: press '/' or run /addkey in chat to update API keys."
+    quick_actions_line = "Tip: run /addkey in chat to update API keys."
     website_line = "Official site: https://uxarion.com/"
 
     console = Console() if RICH_AVAILABLE else None
@@ -1911,7 +1980,6 @@ def print_banner() -> None:
         for line in banner_lines:
             console.print(line, style="cyan")
         console.print(builder_line, style="magenta")
-        console.print(contacts_line, style="green")
         console.print()
         console.print(mission_line, style="cyan")
         console.print(website_line, style="cyan")
@@ -1921,7 +1989,6 @@ def print_banner() -> None:
         for line in banner_lines:
             print(_color(line, getattr(Fore, "CYAN", "")))
         print(_color(builder_line, getattr(Fore, "MAGENTA", "")))
-        print(_color(contacts_line, getattr(Fore, "GREEN", "")))
         print()
         print(_color(mission_line, getattr(Fore, "CYAN", "")))
         print(_color(website_line, getattr(Fore, "CYAN", "")))
@@ -2062,11 +2129,8 @@ Examples:
 
     if policy.show_banner:
         print_banner()
-    print(_color("🎯 Objective:", Fore.CYAN) + f" {args.prompt}")
-    print(_color("🤖 Model:", Fore.CYAN) + f" {OPENAI_MODEL}")
-    print(_color("⚙️ Loop mode:", Fore.CYAN) + f" {args.loop_mode}")
     if policy.dry_run:
-        print(_color("🧪 DRY-RUN MODE – commands will not execute", DIM))
+        print(_color("Dry-run mode: commands will not execute.", DIM))
 
     agent = Agent(policy=policy, provider=args.provider)
     scope_hosts = (
@@ -2094,25 +2158,29 @@ Examples:
             try:
                 cidr_values.append(ipaddress.ip_network(cidr, strict=False))
             except ValueError:
-                print(f"⚠️ Ignoring invalid CIDR: {cidr}")
+                print(f"warning: ignoring invalid CIDR: {cidr}")
         if cidr_values:
             scope_cidrs = cidr_values
 
     report_out_path = args.out
     event_printer = CLIEventPrinter()
-    agent.run(
-        args.prompt,
-        max_commands=args.max_commands,
-        scope_hosts=scope_hosts,
-        allow_tools=allow_tools,
-        deny_tools=deny_tools,
-        scope_cidrs=scope_cidrs,
-        exit_on_first_finding=args.exit_on_first_finding,
-        report_out_path=report_out_path,
-        validate=not args.no_validate,
-        loop_mode=args.loop_mode,
-        event_callback=event_printer,
-    )
+    try:
+        agent.run(
+            args.prompt,
+            max_commands=args.max_commands,
+            scope_hosts=scope_hosts,
+            allow_tools=allow_tools,
+            deny_tools=deny_tools,
+            scope_cidrs=scope_cidrs,
+            exit_on_first_finding=args.exit_on_first_finding,
+            report_out_path=report_out_path,
+            validate=not args.no_validate,
+            loop_mode=args.loop_mode,
+            event_callback=event_printer,
+        )
+    except Exception as exc:
+        print(_color(f"error: {exc}", Fore.RED))
+        return 1
     return 0
 
 
